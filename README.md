@@ -34,11 +34,13 @@ at long range.
 ## How it works
 
 Each shot in the game is a `ZHM5Projectile`. The mod swaps one method of that class (the one that sets a new shot
-up) for its own, which calls the original and only notes the projectile's address. From then on the mod reads the
+up) for its own, which calls the original and records the projectile's address and launch classification. From then on the mod reads the
 projectile's position every frame and adds it to the line, until the projectile stops moving.
 
-Darts and bullets are told apart by their average sampled speed during the first tenth of a second: between
-10 and 150 m/s it is a dart. Time spent stationary after landing is excluded from that speed calculation.
+The SDK's `ZHM5ItemWeapon_FireProjectiles` hook scopes the firing weapon's `GetAmmoType()` to that call
+on the current thread. Projectile setup captures that type: tranquilizer, emetic, and cure dart ammo count
+as darts. Every other type, including setup outside a firing call, counts as an other shot. Classification
+does not depend on distance traveled, frame duration, or collision timing.
 
 ## Troubleshooting
 

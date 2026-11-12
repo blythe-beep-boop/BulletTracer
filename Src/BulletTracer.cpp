@@ -47,16 +47,19 @@ constexpr float kMinStep = 0.02f;
 constexpr float kStillSecondsToLand = 0.5f;
 constexpr float kMaxFlightSeconds = 30.f;
 
-// Darts or bullets: the speed over the first tenth of a second. A tranquilizer dart was measured at about
-// 48 m/s; anything that does not travel in that range is not a dart in flight.
-constexpr float kClassifySeconds = 0.1f;
-constexpr float kMinDartSpeed = 10.f;
-constexpr float kMaxDartSpeed = 150.f;
-
 using SetUpFn = void (*)(void*, void*);
 
 BulletTracer* g_Instance = nullptr;
 SetUpFn g_Original = nullptr;
+
+// Associate synchronous SetUp calls within FireProjectiles with this thread/call:
+// a nested weapon fire must restore its caller, and unrelated setups must not inherit the last gun.
+thread_local eAmmoType g_FiringAmmo = eAmmoType::eUnknownAmmoType;
+struct FiringAmmoScope {
+    eAmmoType Previous = g_FiringAmmo;
+    explicit FiringAmmoScope(eAmmoType p_Ammo) { g_FiringAmmo = p_Ammo; }
+    ~FiringAmmoScope() { g_FiringAmmo = Previous; }
+};
 
 // No C++ objects in here: __try does not mix with destructors.
 bool ReadPosition(const void* p_Projectile, uintptr_t p_VTable, float p_Out[3]) {
@@ -96,6 +99,7 @@ BulletTracer::~BulletTracer() {
 
 void BulletTracer::Init() {
     g_Instance = this;
+    Hooks::ZHM5ItemWeapon_FireProjectiles->AddDetour(this, &BulletTracer::OnFireProjectiles);
     Hooks::ZEntitySceneContext_ClearScene->AddDetour(this, &BulletTracer::OnClearScene);
 }
 
@@ -154,13 +158,21 @@ void BulletTracer::RemoveHook() {
     m_HookOk = false;
 }
 
-// The game sets the shot up as usual; afterwards its address goes on the list for the frame update.
+DEFINE_PLUGIN_DETOUR(BulletTracer, bool, OnFireProjectiles, ZHM5ItemWeapon* th, bool bMayStartSound) {
+    const FiringAmmoScope s_Ammo(th->GetAmmoType());
+    return { HookAction::Return(), p_Hook->CallOriginal(th, bMayStartSound) };
+}
+
+// Capture launch metadata before calling the original setup, then queue it with the address.
+// Unknown/unattributed ammo is an other shot; sampled positions cannot safely identify a dart.
 void BulletTracer::ProjectileSetUp(void* p_This, void* p_Params) {
+    const bool s_Dart = g_FiringAmmo == eAmmoType::eAmmoDartTranquilizer ||
+        g_FiringAmmo == eAmmoType::eAmmoDartEmetic || g_FiringAmmo == eAmmoType::eAmmoDartCure;
     g_Original(p_This, p_Params);
 
     if (g_Instance && g_Instance->m_Enabled) {
         std::scoped_lock s_Lock(g_Instance->m_Mutex);
-        g_Instance->m_NewProjectiles.push_back(p_This);
+        g_Instance->m_NewProjectiles.push_back({p_This, s_Dart ? EKind::Dart : EKind::Bullet});
     }
 }
 
@@ -180,27 +192,16 @@ void BulletTracer::OnFrameUpdate(const SGameUpdateEvent& p_UpdateEvent) {
     UpdateTraces(s_Delta);
 }
 
-// Dart or bullet, from the average speed since the shot. Before kClassifySeconds the shot stays unknown,
-// unless it has already ended (p_Final): then what there is decides.
-void BulletTracer::Classify(Trace& p_Trace, bool p_Final) {
-    if (p_Trace.Kind != EKind::Unknown || (!p_Final && p_Trace.Age < kClassifySeconds)) {
+// Count once, using the metadata captured for this launch, including zero-length flights.
+void BulletTracer::Classify(Trace& p_Trace, EKind p_Kind) {
+    if (p_Trace.Kind != EKind::Unknown) {
         return;
     }
-
-    bool s_Dart = false;
-
-    if (p_Trace.LastPointAge > 0.f && !p_Trace.Points.empty()) {
-        // Match the elapsed time to the sampled displacement, not to later stationary/invalid frames.
-        const float s_Speed = Distance(p_Trace.Points.front(), p_Trace.Points.back()) / p_Trace.LastPointAge;
-        s_Dart = s_Speed >= kMinDartSpeed && s_Speed <= kMaxDartSpeed;
-    }
-
-    if (s_Dart) {
-        p_Trace.Kind = EKind::Dart;
+    p_Trace.Kind = p_Kind;
+    if (p_Kind == EKind::Dart) {
         ++m_DartsSeen;
     }
     else {
-        p_Trace.Kind = EKind::Bullet;
         ++m_BulletsSeen;
     }
 }
@@ -218,8 +219,8 @@ void BulletTracer::UpdateTraces(float p_Delta) {
             }
 
             // SetUp has already reset reused objects. Never sample the next shot into this line.
-            if (std::find(m_NewProjectiles.begin(), m_NewProjectiles.end(), s_Trace.Projectile) != m_NewProjectiles.end()) {
-                Classify(s_Trace, true);
+            if (std::find_if(m_NewProjectiles.begin(), m_NewProjectiles.end(),
+                    [&](const NewProjectile& p_New) { return p_New.Projectile == s_Trace.Projectile; }) != m_NewProjectiles.end()) {
                 s_Trace.Flying = false;
                 s_Trace.Projectile = nullptr;
                 continue;
@@ -234,7 +235,6 @@ void BulletTracer::UpdateTraces(float p_Delta) {
 
                 if (s_Trace.Points.empty() || Distance(s_Trace.Points.back(), s_Point) >= kMinStep) {
                     s_Trace.Points.push_back(s_Point);
-                    s_Trace.LastPointAge = s_Trace.Age;
                     s_Trace.StillTime = 0.f;
                 }
                 else {
@@ -242,8 +242,6 @@ void BulletTracer::UpdateTraces(float p_Delta) {
                     s_Ended = s_Trace.StillTime >= kStillSecondsToLand;
                 }
             }
-
-            Classify(s_Trace, s_Ended);
 
             if (s_Ended) {
                 s_Trace.Flying = false;
@@ -255,11 +253,11 @@ void BulletTracer::UpdateTraces(float p_Delta) {
     TrimTraces();
 
     // The new shots, after the others, so they start with no time of their own on the clock.
-    for (void* s_Projectile : m_NewProjectiles) {
+    for (const auto& s_New : m_NewProjectiles) {
+        void* s_Projectile = s_New.Projectile;
         // The game reuses projectiles: a new shot from the same one ends the old line.
         for (auto& s_Trace : m_Traces) {
             if (s_Trace.Flying && s_Trace.Projectile == s_Projectile) {
-                Classify(s_Trace, true);
                 s_Trace.Flying = false;
                 s_Trace.Projectile = nullptr;
             }
@@ -268,6 +266,7 @@ void BulletTracer::UpdateTraces(float p_Delta) {
         Trace s_Trace;
         s_Trace.Projectile = s_Projectile;
         s_Trace.VTable = s_VTable;
+        Classify(s_Trace, s_New.Kind);
 
         float s_Pos[3];
 
@@ -390,8 +389,7 @@ void BulletTracer::OnDepthDraw3D(IRenderer* p_Renderer) {
     }
 }
 
-// A shot still unknown (its first tenth of a second) is drawn only with "Trace all shots": with darts only,
-// its line appears whole as soon as it turns out to be a dart.
+// Only ammo identified as darts at launch is visible in darts-only mode.
 void BulletTracer::DrawTraces(IRenderer* p_Renderer) {
     if (!m_Enabled) {
         return;

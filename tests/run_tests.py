@@ -32,13 +32,18 @@ def main():
     constants = source[source.index("constexpr size_t kMaxTraces"):
                        source.index("using SetUpFn")]
     definitions = "\n".join(block(header, name) + ";" for name in
-                            ("enum class EKind", "struct Trace"))
+                            ("enum class EKind", "struct NewProjectile", "struct Trace"))
     methods = "\n".join(block(source, name) for name in (
         "float Distance(", "BulletTracer::~BulletTracer()",
         "void BulletTracer::Classify(", "void BulletTracer::UpdateTraces(",
+        "void BulletTracer::ProjectileSetUp(", "void BulletTracer::DrawTraces(",
         "void BulletTracer::TrimTraces()", "void BulletTracer::RemoveCrippleBox()"))
+    methods += "\n" + block(source, "DEFINE_PLUGIN_DETOUR(BulletTracer, bool, OnFireProjectiles,").replace(
+        "DEFINE_PLUGIN_DETOUR(BulletTracer, bool, OnFireProjectiles, ZHM5ItemWeapon* th, bool bMayStartSound)",
+        "HookResult BulletTracer::OnFireProjectiles(ZHM5ItemWeapon* th, bool bMayStartSound)")
     harness = (ROOT / "tests/regression.cpp.in").read_text()
     harness = harness.replace("// PRODUCTION_CONSTANTS", constants)
+    harness = harness.replace("// PRODUCTION_SCOPE", "thread_local eAmmoType g_FiringAmmo = eAmmoType::eUnknownAmmoType;\n" + block(source, "struct FiringAmmoScope") + ";")
     harness = harness.replace("// PRODUCTION_TYPES", definitions)
     harness = harness.replace("// PRODUCTION_METHODS", methods)
     with tempfile.TemporaryDirectory(prefix="bullettracer-tests-") as directory:

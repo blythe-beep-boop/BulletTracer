@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -57,11 +58,36 @@ namespace Functions {
     auto* ZEntityManager_DeleteEntity = &deleteEntity;
 }
 
+enum class eAmmoType { eUnknownAmmoType, eAmmoGun, eAmmoDartTranquilizer, eAmmoDartEmetic, eAmmoDartCure };
+// PRODUCTION_SCOPE
+struct ZHM5ItemWeapon {
+    eAmmoType Ammo;
+    eAmmoType GetAmmoType() { return Ammo; }
+};
+struct HookAction { static int Return() { return 0; } };
+struct HookResult { int Action; bool Result; };
+struct FireHook {
+    std::function<bool()> Fire;
+    bool CallOriginal(ZHM5ItemWeapon*, bool) { const auto call = Fire; return call(); }
+} fireHook;
+auto* p_Hook = &fireHook;
+void OriginalSetUp(void*, void*) {}
+auto g_Original = &OriginalSetUp;
+struct SVector4 { SVector4(float, float, float, float) {} };
+struct IRenderer {
+    int Lines = 0;
+    void DrawLine3D(const SVector3&, const SVector3&, const SVector4&, const SVector4&) { ++Lines; }
+};
 class BulletTracer {
 public:
     // PRODUCTION_TYPES
     ~BulletTracer();
-    void Classify(Trace&, bool);
+    void Classify(Trace&, EKind);
+    static void ProjectileSetUp(void*, void*);
+    HookResult OnFireProjectiles(ZHM5ItemWeapon*, bool);
+    void DrawTraces(IRenderer*);
+    bool m_Enabled = true, m_AllShots = false;
+    float m_Color[4] = {};
     void UpdateTraces(float);
     void TrimTraces();
     void RemoveCrippleBox();
@@ -69,7 +95,7 @@ public:
     void OnFrameUpdate(const SGameUpdateEvent&) {}
     uintptr_t m_ModuleDelta = 0;
     std::mutex m_Mutex;
-    std::vector<void*> m_NewProjectiles;
+    std::vector<NewProjectile> m_NewProjectiles;
     std::vector<Trace> m_Traces;
     int m_DartsSeen = 0;
     int m_BulletsSeen = 0;
@@ -82,8 +108,14 @@ void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 constexpr float dt = 1.f / 60.f;
-void Start(BulletTracer& tracer, Projectile& projectile) {
-    tracer.m_NewProjectiles.push_back(&projectile);
+void Launch(BulletTracer& tracer, Projectile& projectile, eAmmoType ammo) {
+    g_Instance = &tracer;
+    ZHM5ItemWeapon weapon{ammo};
+    fireHook.Fire = [&] { BulletTracer::ProjectileSetUp(&projectile, nullptr); return true; };
+    Require(tracer.OnFireProjectiles(&weapon, false).Result, "fire result lost");
+}
+void Start(BulletTracer& tracer, Projectile& projectile, eAmmoType ammo = eAmmoType::eAmmoDartTranquilizer) {
+    Launch(tracer, projectile, ammo);
     tracer.UpdateTraces(dt);
 }
 
@@ -116,15 +148,15 @@ int main() {
         Require(events == std::vector<std::string>{"deactivate", "delete"},
                 "entity cleaned up more than once");
     });
-    test("moving darts and bullets retain their classification", [] {
+    test("moving darts and bullets retain their launch classification", [] {
         for (float speed : {48.f, 500.f}) {
             BulletTracer tracer; Projectile projectile;
-            Start(tracer, projectile);
+            Start(tracer, projectile, speed == 48.f ? eAmmoType::eAmmoDartTranquilizer : eAmmoType::eAmmoGun);
             for (int i = 0; i < 10; ++i) {
                 projectile.X += speed * dt; tracer.UpdateTraces(dt);
             }
             auto expected = speed == 48.f ? BulletTracer::EKind::Dart : BulletTracer::EKind::Bullet;
-            Require(tracer.m_Traces[0].Kind == expected, "incorrect speed classification");
+            Require(tracer.m_Traces[0].Kind == expected, "incorrect ammo classification");
             Require(tracer.m_DartsSeen + tracer.m_BulletsSeen == 1, "shot counted more than once");
         }
     });
@@ -136,12 +168,12 @@ int main() {
         Require(tracer.m_Traces[0].Kind == BulletTracer::EKind::Dart, "short dart hidden as bullet");
         Require(!tracer.m_Traces[0].Flying, "landed trace did not finish");
     });
-    test("invalidation time does not lower the sampled dart speed", [] {
+    test("invalidation preserves dart launch classification", [] {
         BulletTracer tracer; Projectile projectile;
         Start(tracer, projectile);
         projectile.X = 48.f * dt; tracer.UpdateTraces(dt);
         projectile.VTable = 0; tracer.UpdateTraces(0.2f);
-        Require(tracer.m_Traces[0].Kind == BulletTracer::EKind::Dart, "invalidation diluted speed");
+        Require(tracer.m_Traces[0].Kind == BulletTracer::EKind::Dart, "invalidation changed classification");
         Require(!tracer.m_Traces[0].Flying, "invalid projectile still tracked");
     });
     test("reuse never appends the next shot to the previous trajectory", [] {
@@ -151,11 +183,13 @@ int main() {
             projectile.X = 48.f * dt; tracer.UpdateTraces(dt);
             const auto oldPoints = tracer.m_Traces[0].Points.size();
             projectile.X = 20.f;
-            tracer.m_NewProjectiles.push_back(&projectile); tracer.UpdateTraces(delta);
+            Launch(tracer, projectile, eAmmoType::eAmmoGun); tracer.UpdateTraces(delta);
             Require(tracer.m_Traces.size() == 2, "new shot missing");
             Require(tracer.m_Traces[0].Points.size() == oldPoints, "spurious segment appended");
             Require(tracer.m_Traces[0].Kind == BulletTracer::EKind::Dart, "reuse changed old classification");
             Require(!tracer.m_Traces[0].Flying, "old shot still flying");
+            Require(tracer.m_Traces[1].Kind == BulletTracer::EKind::Bullet &&
+                    tracer.m_DartsSeen == 1 && tracer.m_BulletsSeen == 1, "reused address kept stale ammo");
             Require(tracer.m_Traces[1].Points.front().x == 20.f && tracer.m_Traces[1].Age == 0.f,
                     "new shot did not start at its own position and age");
         }
@@ -166,9 +200,9 @@ int main() {
         for (int i = 0; i < 100; ++i) tracer.UpdateTraces(0.f);
         Require(tracer.m_Traces[0].Age == 0.f && tracer.m_Traces[0].Flying, "pause ended flight");
     });
-    test("unmeasurable shots finish without inventing a dart", [] {
+    test("unattributed shots finish without inventing a dart", [] {
         BulletTracer tracer; Projectile projectile;
-        Start(tracer, projectile);
+        Start(tracer, projectile, eAmmoType::eUnknownAmmoType);
         for (int i = 0; i < 40; ++i) tracer.UpdateTraces(dt);
         Require(tracer.m_Traces[0].Kind == BulletTracer::EKind::Bullet, "stationary point classified as dart");
         Require(!tracer.m_Traces[0].Flying, "stationary trace never ended");
@@ -212,11 +246,60 @@ int main() {
     test("paused projectile bursts enforce history limit", [] {
         BulletTracer tracer;
         std::vector<Projectile> projectiles(kMaxTraces + 20);
-        for (auto& projectile : projectiles) tracer.m_NewProjectiles.push_back(&projectile);
+        for (auto& projectile : projectiles) tracer.m_NewProjectiles.push_back({&projectile, BulletTracer::EKind::Bullet});
         tracer.UpdateTraces(0.f);
         Require(tracer.m_Traces.size() == kMaxTraces, "burst exceeded limit");
         Require(tracer.m_Traces.front().Projectile == &projectiles[20], "newest shots not retained");
         Require(tracer.m_NewProjectiles.empty(), "pending shots not drained");
+    });
+    test("wall-stopped bullets stay out of darts-only rendering", [] {
+        BulletTracer tracer; Projectile projectile;
+        Start(tracer, projectile, eAmmoType::eAmmoGun);
+        projectile.X = 0.5f; tracer.UpdateTraces(dt);
+        for (int i = 0; i < 40; ++i) tracer.UpdateTraces(dt);
+        Require(tracer.m_DartsSeen == 0 && tracer.m_BulletsSeen == 1, "near-wall bullet counted as dart");
+        IRenderer renderer; tracer.DrawTraces(&renderer);
+        Require(renderer.Lines == 0, "bullet shown in darts-only mode");
+        tracer.m_AllShots = true; tracer.DrawTraces(&renderer);
+        Require(renderer.Lines == 1, "all-shots mode hid bullet");
+    });
+    test("identical short trajectories are distinguished by launch ammo", [] {
+        for (auto ammo : {eAmmoType::eAmmoGun, eAmmoType::eAmmoDartEmetic}) {
+            BulletTracer tracer; Projectile projectile;
+            Start(tracer, projectile, ammo);
+            projectile.X = 0.5f; tracer.UpdateTraces(dt);
+            for (int i = 0; i < 40; ++i) tracer.UpdateTraces(dt);
+            IRenderer renderer; tracer.DrawTraces(&renderer);
+            Require(renderer.Lines == (ammo == eAmmoType::eAmmoDartEmetic ? 1 : 0),
+                    "ambiguous displacement overrode ammo metadata");
+        }
+    });
+    test("all dart ammo survives immediate impact without speed samples", [] {
+        for (auto ammo : {eAmmoType::eAmmoDartTranquilizer, eAmmoType::eAmmoDartEmetic, eAmmoType::eAmmoDartCure}) {
+            BulletTracer tracer; Projectile projectile;
+            Start(tracer, projectile, ammo);
+            for (int i = 0; i < 40; ++i) tracer.UpdateTraces(dt);
+            Require(tracer.m_DartsSeen == 1 && tracer.m_BulletsSeen == 0, "immediate dart lost");
+        }
+    });
+    test("nested firing restores ammo and unrelated setup inherits none", [] {
+        BulletTracer tracer; Projectile outer, inner, unrelated;
+        g_Instance = &tracer;
+        ZHM5ItemWeapon dart{eAmmoType::eAmmoDartEmetic}, gun{eAmmoType::eAmmoGun};
+        fireHook.Fire = [&] {
+            const auto outerFire = fireHook.Fire;
+            fireHook.Fire = [&] { BulletTracer::ProjectileSetUp(&inner, nullptr); return false; };
+            Require(!tracer.OnFireProjectiles(&gun, false).Result, "false fire result lost");
+            fireHook.Fire = outerFire;
+            BulletTracer::ProjectileSetUp(&outer, nullptr);
+            return true;
+        };
+        tracer.OnFireProjectiles(&dart, true);
+        BulletTracer::ProjectileSetUp(&unrelated, nullptr);
+        tracer.UpdateTraces(dt);
+        Require(tracer.m_Traces[0].Kind == BulletTracer::EKind::Bullet &&
+                tracer.m_Traces[1].Kind == BulletTracer::EKind::Dart &&
+                tracer.m_Traces[2].Kind == BulletTracer::EKind::Bullet, "ammo leaked between launches");
     });
     return failed ? 1 : 0;
 }

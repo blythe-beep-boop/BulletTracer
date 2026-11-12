@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Classify shots from firing-weapon ammo metadata rather than sampled speed, so bullets stopped near walls
+  cannot become darts. Preserve short and immediate-impact darts, including cure darts.
+
 - Bound trace history to 500 shots and 100,000 points, evicting oldest completed traces first.
 
 - Remove the mod's infinite-ammo override when the mod is unloaded.

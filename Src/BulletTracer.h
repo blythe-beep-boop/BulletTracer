@@ -8,6 +8,7 @@
 
 #include <Glacier/ZEntity.h>
 #include <Glacier/ZMath.h>
+#include <Glacier/ZItem.h>
 
 /**
  * BulletTracer - draws the path of the shots fired in the game. By default only the darts (Sieker,
@@ -15,11 +16,11 @@
  * drop; with "Trace all shots" every other shot too.
  *
  * Each shot is a ZHM5Projectile of the game's own. Its set-up method (slot 25 of the vtable at Ghidra
- * 0x141e1f6a0) is redirected here for a moment, just to learn the projectile's address; from then on its
- * position is read every frame (+0xf8 of that interface, found by watching its memory in flight) and
+ * 0x141e1f6a0) is redirected here to capture its address and the firing weapon's ammo type.
+ * From then on its position is read every frame (+0xf8 of that interface, found by watching its memory in flight) and
  * added to the line until it stops moving. The lines stay until cleared or evicted by the history limits.
  *
- * Darts and bullets are told apart by speed: a dart flies at about 50 m/s, a bullet many times faster.
+ * Darts are identified by ammo type while the weapon fires, never by collision-limited displacement.
  */
 class BulletTracer : public IPluginInterface {
 public:
@@ -39,6 +40,11 @@ private:
         Bullet,
     };
 
+    struct NewProjectile {
+        void* Projectile;
+        EKind Kind;
+    };
+
     struct Trace {
         void* Projectile = nullptr;
         uintptr_t VTable = 0;
@@ -46,7 +52,6 @@ private:
         bool Flying = true;
         float StillTime = 0.f; // Game time without moving: while the game is paused it does not pass.
         float Age = 0.f;       // Game time since the shot.
-        float LastPointAge = 0.f; // Age at the last sampled movement, excluding time spent landed.
         EKind Kind = EKind::Unknown;
     };
 
@@ -59,11 +64,13 @@ private:
     void SetInfiniteAmmo();
     bool CreateCrippleBox();
     void RemoveCrippleBox();
-    void Classify(Trace& p_Trace, bool p_Final);
+    void Classify(Trace& p_Trace, EKind p_Kind);
 
     static void ProjectileSetUp(void* p_This, void* p_Params);
 
     DECLARE_PLUGIN_DETOUR(BulletTracer, void, OnClearScene, ZEntitySceneContext* th, bool p_FullyUnloadScene);
+
+    DECLARE_PLUGIN_DETOUR(BulletTracer, bool, OnFireProjectiles, ZHM5ItemWeapon* th, bool bMayStartSound);
 
     // Settings.
     bool m_ShowWindow = false;
@@ -81,7 +88,7 @@ private:
 
     // Shots.
     std::mutex m_Mutex;
-    std::vector<void*> m_NewProjectiles; // Filled by the hook, emptied on the frame update.
+    std::vector<NewProjectile> m_NewProjectiles; // Filled by the hook, emptied on the frame update.
     std::vector<Trace> m_Traces;
     int m_DartsSeen = 0;
     int m_BulletsSeen = 0;
